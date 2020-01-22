@@ -1,0 +1,2 @@
+#!/bin/bash
+python3 dde.py --train --dataset mnist --activation softplus --sigma 0.5 --batch_size 100 --epochs 50 --dataset_dir /data/torch --dense_sigmoid --n_input 16 --n_hidden 256 --n_layers 16 --vis_path output-mnist/

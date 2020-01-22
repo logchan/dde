@@ -1,0 +1,6 @@
+# density estimation only
+python3 dde.py --device cuda:0 --load_from models/*-dde-nogen-s0.* --visualize
+# with samples
+python3 dde.py --device cuda:0 --load_from models/cb-dde-s0.2 --visualize
+python3 dde.py --device cuda:0 --load_from models/eg-dde-s0.2 --activation relu --visualize
+python3 dde.py --device cuda:0 --load_from models/ts-dde-s0.2 --activation relu --visualize
