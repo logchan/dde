@@ -17,6 +17,12 @@ loader = None
 output_shape = None
 is_toy_dataset = True
 
+class SinActivation(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, x):
+        return torch.sin(x)
+
 def activation_from_name(name):
     name = name.lower()
     if name == 'relu':
@@ -27,6 +33,8 @@ def activation_from_name(name):
         return nn.Sigmoid
     elif name == 'tanh':
         return nn.Tanh
+    elif name == 'sin':
+        return SinActivation
     elif name.startswith('lrelu:'):
         return lambda: nn.LeakyReLU(float(name[6:]))
     else:
@@ -116,7 +124,10 @@ def visualize(path):
             pp.close(fig)
 
             fig, ax = createFigure()
-            plotToySamples(ax, model.nets[0].random(50000).cpu().numpy())
+            samples = model.nets[0].random(args.n_toy_samples).cpu().numpy()
+            plotToySamples(ax, samples)
+            if not args.save_toy_samples_to is None:
+                np.savez_compressed(args.save_toy_samples_to, data=samples)
             fig.savefig(path + 'dde_gen_samples.png')
             pp.close(fig)
     else:
@@ -162,9 +173,9 @@ def train():
     optms = [gen_optm, dde_real_optm, dde_gen_optm]
 
     if args.lr_step > 0:
-        schedulers = [torch.optim.lr_scheduler.StepLR(gen_optm, args.lr_step, args.lr_gamma), 
-                      torch.optim.lr_scheduler.StepLR(dde_real_optm, args.lr_step, args.lr_gamma),
-                      torch.optim.lr_scheduler.StepLR(dde_gen_optm, args.lr_step, args.lr_gamma)]
+        schedulers = [torch.optim.lr_scheduler.StepLR(gen_optm, args.lr_step, args.lr_step_gamma), 
+                      torch.optim.lr_scheduler.StepLR(dde_real_optm, args.lr_step, args.lr_step_gamma),
+                      torch.optim.lr_scheduler.StepLR(dde_gen_optm, args.lr_step, args.lr_step_gamma)]
 
     sigma = args.sigma
     batch_id = 0
@@ -365,7 +376,8 @@ def run(argv):
     # model parameters
     #parser.add_argument('--type', type=str, default='mlp', help='Network architecture (mlp, densenet, or dcgan)')
     parser.add_argument('--dense_sigmoid', action='store_true', default=False, help='Add sigmoid to DenseNet generator')
-    parser.add_argument('--activation', type=str, default='softplus', help='Generator activation function')
+    parser.add_argument('--gen_activation', type=str, default='softplus', help='Generator activation function')
+    parser.add_argument('--dde_activation', type=str, default='softplus', help='Discriminator activation function')
     parser.add_argument('--n_input', type=int, default=2, help='Number of input to generator')
     parser.add_argument('--n_hidden', type=int, default=32, help='Number of hidden units in a layer')
     parser.add_argument('--n_gen_hidden', type=int, default=64, help='Number of hidden units in DenseNet generator layer')
@@ -377,6 +389,8 @@ def run(argv):
     parser.add_argument('--device', type=str, default='cuda:0', help='PyTorch device')
     # visualization
     parser.add_argument('--visualize', action='store_true', default=False, help='Visualize a model')
+    parser.add_argument('--n_toy_samples', type=int, default=50000, help='Number of samples to visualize for toy datasets')
+    parser.add_argument('--save_toy_samples_to', type=str, default=None, help='If specified, save generated toy samples to file')
     parser.add_argument('--vis_path', type=str, default='', help='Path prefix to save visualization figures. Folder must end with /')
 
     args = parser.parse_args(argv) if not argv is None else parser.parse_args()
@@ -416,23 +430,24 @@ def run(argv):
     output_length = loader.dataset[0][0].view(-1).shape[0]
     print(f'Output length: {output_length}')
 
-    activation = activation_from_name(args.activation)
+    gen_activation = activation_from_name(args.gen_activation)
+    dde_activation = activation_from_name(args.dde_activation)
     if args.type == 'mlp':
-        model = DdeModel(MlpModule(output_length, args.n_hidden, args.n_layers, output_length, activation, True, args.device),
-                         MlpModule(output_length, args.n_hidden, args.n_layers, 1, nn.Softplus, False, args.device),
-                         MlpModule(output_length, args.n_hidden, args.n_layers, 1, nn.Softplus, False, args.device))
+        model = DdeModel(MlpModule(output_length, args.n_hidden, args.n_layers, output_length, gen_activation, True, args.device),
+                         MlpModule(output_length, args.n_hidden, args.n_layers, 1, dde_activation, False, args.device),
+                         MlpModule(output_length, args.n_hidden, args.n_layers, 1, dde_activation, False, args.device))
     elif args.type == 'densenet':
         end_activation = nn.Sigmoid if args.dense_sigmoid else None
-        model = DdeModel(DenseNetModule(args.n_input, args.n_gen_hidden, args.n_layers, output_length, activation, end_activation, args.device),
-                         DenseNetModule(output_length, args.n_hidden, args.n_layers, 1, nn.Softplus, None, args.device),
-                         DenseNetModule(output_length, args.n_hidden, args.n_layers, 1, nn.Softplus, None, args.device))
+        model = DdeModel(DenseNetModule(args.n_input, args.n_gen_hidden, args.n_layers, output_length, gen_activation, end_activation, args.device),
+                         DenseNetModule(output_length, args.n_hidden, args.n_layers, 1, dde_activation, None, args.device),
+                         DenseNetModule(output_length, args.n_hidden, args.n_layers, 1, dde_activation, None, args.device))
     elif args.type == 'dcgan':
         dsc_activation = activation_from_name(args.dsc_activation)
         model = DdeModel(Generator(args.n_input, args.n_feat_gen, output_shape[0], args.gen_bn, args.device),
         Discriminator(args.n_feat_dsc, output_shape[0], dsc_activation, None, False, args.device),
         Discriminator(args.n_feat_dsc, output_shape[0], dsc_activation, None, False, args.device))
     elif args.type == 'ncsn':
-        model = NetModel(NCSNDde(64, activation, args.device))
+        model = NetModel(NCSNDde(64, gen_activation, args.device))
     else:
         print(f'Unknown model type: {args.type}')
 
