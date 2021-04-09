@@ -8,14 +8,16 @@ import random
 import matplotlib.pyplot as pp
 import os
 
-from datasets import toyLoader, eightGaussiansLoader, twoSpiralsLoader, checkerboardLoader, ringsLoader, mnistLoader, fashionLoader, stackedMnistLoader
+from datasets import toyLoader, eightGaussiansLoader, twoSpiralsLoader, checkerboardLoader, ringsLoader, mnistLoader, fashionLoader, stackedMnistLoader, uciLoader
 from modules import MlpModule, DenseNetModule, Generator, Discriminator, NCSNDde
 
 args = None
 model = None
 loader = None
+test_loader = None
 output_shape = None
-is_toy_dataset = True
+visualization_mode = "toys"
+numbers_vis_best = None
 
 class SinActivation(nn.Module):
     def __init__(self):
@@ -103,15 +105,62 @@ def plotToySamples(ax, data, limit=4, cmap=pp.cm.jet):
     lower = -limit
     ax.hist2d(data[:,0], data[:,1], range=[[lower, upper],[lower, upper]], bins=int(math.sqrt(len(data))),cmap=cmap)
 
-def visualize(path):
+# https://en.wikipedia.org/wiki/List_of_logarithmic_identities
+def getLogPartition(batch):
+    max_val = np.max(batch)
+    batch = batch - max_val
+    batch = np.exp(batch)
+    val = 1.0 + np.sum(batch)
+    Z = max_val + np.log(val)
+    return Z
+
+def getNormalizingConstant(dde, sigma, n_iters):
+    pots_dde = []
+    for j in range(n_iters):
+        gauss_sigma = np.sqrt(1 + sigma**2)
+        batch_gauss = np.random.normal(0, gauss_sigma, size=[1024, dde.n_input]).astype(np.float32)
+        v = gauss_sigma**2
+        err = -0.5 * np.mean(batch_gauss**2, axis=1, keepdims=True) / v
+        Z2 = (2*np.pi*v)**dde.n_input
+        batch_prob_gauss = err - np.log(np.sqrt(Z2))
+        with torch.no_grad():
+            log_prob_dde = dde(torch.from_numpy(batch_gauss).to(dde.device)).cpu().numpy()
+        pots_dde += [log_prob_dde - batch_prob_gauss]
+
+    pots_dde = np.concatenate(pots_dde, axis=0)
+    Z = getLogPartition(pots_dde) - np.log(pots_dde.shape[0])
+
+    return Z
+
+def testAverageLL(sigma, n_iters, n_samples):
+    probs = []
+    dde = model.nets[1]
+    with torch.no_grad():
+        for _, b_data in enumerate(test_loader):
+            net_input = b_data[0].to(dde.device)
+            probs += [dde(net_input).cpu().numpy()]
+    probs = np.concatenate(probs, axis=0)
+    avg_ll = np.mean(probs)
+
+    ans = []
+    for i in range(n_iters):
+        Z = getNormalizingConstant(dde, sigma, n_samples)
+        res = avg_ll - Z
+        ans += [res]
+    ans = np.array(ans)
+    return np.mean(ans), np.sqrt(np.var(ans))
+
+def visualize(path, sigma):
+    global numbers_vis_best
+    print(f'Visualizing the model ({path})')
+
     if path is None:
         path = ''
     else:
         path += '_'
-    path = args.vis_path + path
+    path = args.vis_path + '/' + path
 
-    print('Visualizing the model')
-    if is_toy_dataset:
+    if visualization_mode == 'toys':
         fig, ax = createFigure()
         plotDdeDensity(ax, model.nets[1])
         fig.savefig(path + 'dde_real_density.png')
@@ -130,7 +179,7 @@ def visualize(path):
                 np.savez_compressed(args.save_toy_samples_to, data=samples)
             fig.savefig(path + 'dde_gen_samples.png')
             pp.close(fig)
-    else:
+    elif visualization_mode == 'images':
         imgs = model.nets[0].random(10).cpu().numpy()
         fig = pp.figure(figsize=(5, 2))
         ax = fig.subplots(2, 5)
@@ -145,6 +194,13 @@ def visualize(path):
                 ax[y,x].set_axis_off()
         fig.savefig(path + 'dde_gen_samples.png')
         pp.close(fig)
+    elif visualization_mode == 'numbers':
+        mean, std = testAverageLL(sigma, 5, args.n_uci_samples // 1024)
+        if numbers_vis_best is None or mean > numbers_vis_best:
+            numbers_vis_best = mean
+        print(f"average log-likelihood {mean:.2f}, std {std:.2f}, best {numbers_vis_best:.2f}")
+    else:
+        print('visualization not supported')
 
 ### Train
 
@@ -161,6 +217,13 @@ def _get_dde_output(sigma, dde, x):
     prob = dde(x)
     grad = torch.autograd.grad(prob, x, grad_outputs=torch.ones(prob.shape, device=prob.device), create_graph=True)[0]
     return x + grad*sigma*sigma, prob
+
+def _print_stats(stats, epoch):
+    for key in stats:
+        value = stats[key]
+        if len(value) > 0:
+            value = f'{sum(value) / len(value):e}'
+            print(f'Epoch {epoch} {key} {value}')
 
 def train():
     print('Training the model')
@@ -180,19 +243,22 @@ def train():
     sigma = args.sigma
     batch_id = 0
     if args.visualize_every > 0:
-        visualize('batch_0')
+        visualize('batch_0', sigma)
         
     for epoch in range(1, 1+args.epochs):
         stats = {}
-        stats['kl_loss'] = 0
-        stats['loss_dde_real'] = 0
-        stats['loss_dde_gen'] = 0
-        if args.reduce_sigma_every > 0 and (epoch % args.reduce_sigma_every == 0):
-            sigma *= args.reduce_sigma_gamma
-            print(f'Reduced sigma to {sigma}')
-        
+        stats['kl_loss'] = []
+        stats['loss_dde_real'] = []
+        stats['loss_dde_gen'] = []
+
         for batch_i, batch_data in enumerate(loader):
             batch_id += 1
+
+            if args.reduce_sigma_every > 0 and (batch_id % args.reduce_sigma_every == 0):
+                new_sigma = max(sigma * args.reduce_sigma_gamma, args.min_sigma)
+                if new_sigma < sigma:
+                    sigma = new_sigma
+                    print(f'Reduced sigma to {sigma}')
 
             net_input = None
             kl_loss = 0
@@ -212,7 +278,7 @@ def train():
                 loss_dde_real = F.mse_loss(dde_real_output_real, net_gt, reduction='sum') / 2
                 loss_dde_real.backward()
                 dde_real_optm.step()
-                stats['loss_dde_real'] += float(loss_dde_real)
+                stats['loss_dde_real'] += [float(loss_dde_real)]
 
             # Train dde_gen and gen
             if args.train_generator:
@@ -223,7 +289,7 @@ def train():
                 loss_dde_gen = F.mse_loss(dde_gen_output_gen, gen_output, reduction='sum') / 2
                 loss_dde_gen.backward()
                 dde_gen_optm.step()
-                stats['loss_dde_gen'] += float(loss_dde_gen)
+                stats['loss_dde_gen'] += [float(loss_dde_gen)]
 
                 # gen
                 if batch_id % args.train_gen_every == 0:
@@ -239,16 +305,16 @@ def train():
                     kl_loss.backward()
 
                     gen_optm.step()
-                    stats['kl_loss'] += float(kl_loss)
+                    stats['kl_loss'] += [float(kl_loss)]
             if args.visualize_every > 0 and batch_id % args.visualize_every == 0:
-                visualize(f'batch_{batch_id}')
+                visualize(f'batch_{batch_id}', sigma)
         # -- end batch --
 
-        for key in stats:
-            value = stats[key]
-            if isinstance(value, float):
-                value = f'{value:e}'
-            print(f'Epoch {epoch} {key} {value}')
+        _print_stats(stats, epoch)
+        if args.lr_step > 0:
+            for scheduler in schedulers:
+                scheduler.step()
+
     # -- end epoch --
     if not args.save_to is None:
         model.save(args.save_to)
@@ -310,7 +376,7 @@ def train_ncsn():
 
     for epoch in range(1, 1+args.epochs):
         stats = {}
-        stats['loss_dde_real'] = 0
+        stats['loss_dde_real'] = []
         
         for batch_i, batch_data in enumerate(loader):
             batch_id += 1
@@ -326,17 +392,13 @@ def train_ncsn():
             loss_dde_real = F.mse_loss(dde_real_output_real, net_gt, reduction='sum') / 2
             loss_dde_real.backward()
             optm.step()
-            stats['loss_dde_real'] += float(loss_dde_real)
+            stats['loss_dde_real'] += [float(loss_dde_real)]
 
             if args.visualize_every > 0 and batch_id % args.visualize_every == 0:
                 visualize_ncsn(f'batch_{batch_id}')
         # -- end batch --
 
-        for key in stats:
-            value = stats[key]
-            if isinstance(value, float):
-                value = f'{value:e}'
-            print(f'Epoch {epoch} {key} {value}')
+        _print_stats(stats, epoch)
     # -- end epoch --
     if not args.save_to is None:
         model.save(args.save_to)
@@ -345,22 +407,24 @@ def run(argv):
     global args
     global model
     global loader
+    global test_loader
     global output_shape
-    global is_toy_dataset
+    global visualization_mode
 
     parser = argparse.ArgumentParser()
     # training
     parser.add_argument('--train', action='store_true', default=False, help='Train a model')
     parser.add_argument('--train_generator', type=bool, default=True, help='Include generator training')
-    parser.add_argument('--sigma', type=float, default=0.2, help='Noise standard deviation')
     parser.add_argument('--save_to', type=str, default='model.bin', help='Where to save the trained model')
     parser.add_argument('--batch_size', type=int, default=2048, help='Training batch size')
     parser.add_argument('--epochs', type=int, default=200, help='Number of epochs to train')
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
     parser.add_argument('--lr_step', type=int, default=0, help='Learning rate step size')
     parser.add_argument('--lr_step_gamma', type=float, default=0.5, help='Learning rate step gamma')
-    parser.add_argument('--reduce_sigma_every', type=int, default=0, help='Decrease sigma value every N epochs')
+    parser.add_argument('--sigma', type=float, default=0.2, help='Noise standard deviation')
+    parser.add_argument('--reduce_sigma_every', type=int, default=0, help='Decrease sigma value every N batches')
     parser.add_argument('--reduce_sigma_gamma', type=float, default=0.8, help='When decreasing sigma, sigma *= sigma_gamma')
+    parser.add_argument("--min_sigma", type=float, default=0, help='Lower bound of sigma')
     parser.add_argument('--stop_training_real_dde_after', type=int, default=-1, help='Only train real_dde for this number of epochs')
     parser.add_argument('--train_gen_every', type=int, default=10, help='Step generator every N iterations')
     parser.add_argument('--visualize_every', type=int, default=50, help='Visualize model every N batches')
@@ -374,7 +438,6 @@ def run(argv):
     parser.add_argument('--datasize', type=int, default=51200, help='Datasize (pseudo, for epoch computation) for 2D datasets')
     parser.add_argument('--dynamic', action='store_true', default=True, help='Whether 2D datasets are dynamically generated')
     # model parameters
-    #parser.add_argument('--type', type=str, default='mlp', help='Network architecture (mlp, densenet, or dcgan)')
     parser.add_argument('--dense_sigmoid', action='store_true', default=False, help='Add sigmoid to DenseNet generator')
     parser.add_argument('--gen_activation', type=str, default='softplus', help='Generator activation function')
     parser.add_argument('--dde_activation', type=str, default='softplus', help='Discriminator activation function')
@@ -391,7 +454,8 @@ def run(argv):
     parser.add_argument('--visualize', action='store_true', default=False, help='Visualize a model')
     parser.add_argument('--n_toy_samples', type=int, default=50000, help='Number of samples to visualize for toy datasets')
     parser.add_argument('--save_toy_samples_to', type=str, default=None, help='If specified, save generated toy samples to file')
-    parser.add_argument('--vis_path', type=str, default='', help='Path prefix to save visualization figures. Folder must end with /')
+    parser.add_argument('--vis_path', type=str, default='', help='Path prefix to save visualization figures.')
+    parser.add_argument('--n_uci_samples', type=int, default=51200, help='Number of samples to use when computing UCI ALL')
 
     args = parser.parse_args(argv) if not argv is None else parser.parse_args()
 
@@ -407,19 +471,24 @@ def run(argv):
     elif args.dataset == 'mnist':
         loader = mnistLoader(args.dataset_dir, args.download, args.batch_size)
         args.type = 'densenet'
-        is_toy_dataset = False
+        visualization_mode = 'images'
     elif args.dataset == 'fashion':
         loader = fashionLoader(args.dataset_dir, args.download, args.batch_size)
         args.type = 'densenet'
-        is_toy_dataset = False
+        visualization_mode = 'images'
     elif args.dataset == 'stacked-mnist':
         loader = stackedMnistLoader(args.dataset_dir, args.download, args.batch_size)
         args.type = 'dcgan'
-        is_toy_dataset = False
+        visualization_mode = 'images'
     elif args.dataset == 'ncsn':
         loader = stackedMnistLoader(args.dataset_dir, args.download, args.batch_size)
         args.type = 'ncsn'
-        is_toy_dataset = False
+        visualization_mode = 'images'
+    elif args.dataset.startswith('uci_'):
+        name = args.dataset[4:]
+        loader, test_loader = uciLoader(args.dataset_dir, name, args.batch_size)
+        args.type = 'mlp'
+        visualization_mode = 'numbers'
     else:
         print(f'Unknown dataset: {args.dataset}')
         return
@@ -465,7 +534,7 @@ def run(argv):
             train()
     
     if args.visualize:
-        visualize(None)
+        visualize(None, args.min_sigma)
 
 if __name__ == "__main__":
     run(None)

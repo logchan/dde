@@ -150,3 +150,11 @@ def stackedMnistLoader(root, download, batch_size, train=True, transform=None, s
         data_size = batch_size * 100
     dataset = StackedMNISTDataset(root, data_size, train, _getTransform(transform), download)
     return _createLoader(dataset, batch_size, shuffle)
+
+def uciLoader(root, name, batch_size):
+    data = np.load(f"{root}/{name}.npz")
+    train = np.concatenate([data["train"], data["val"]], axis=0)
+    train_set = torch.utils.data.TensorDataset(torch.from_numpy(train))
+    test = data["test"]
+    test_set = torch.utils.data.TensorDataset(torch.from_numpy(test))
+    return _createLoader(train_set, batch_size, True), _createLoader(test_set, batch_size, False)
