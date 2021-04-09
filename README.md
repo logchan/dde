@@ -8,3 +8,12 @@ Learning generative probabilistic models that can estimate the continuous densit
 
 See the [manuscript](https://arxiv.org/abs/2001.02728) for details of our method.
 
+# Interactive tutorial
+
+Check [this repository](https://github.com/siavashBigdeli/DDE) for interactive tutorials with Jupyter notebooks.
+
+# How to use
+
+For toy data, MNIST, UCI datasets: check the `train_*.sh` scripts for training. To run experiments for UCI datasets, download the data from [Google Drive](https://drive.google.com/file/d/1eyT2h04GkhRkD8S4-tyWZ6oxZpPgjY3S/view?usp=sharing).
+
+For CelebA, check the `celeba` folder.
